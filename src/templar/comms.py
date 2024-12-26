@@ -35,8 +35,6 @@ from typing import List, Dict, Tuple
 # Local imports
 from . import __version__
 from .config import (
-    AWS_ACCESS_KEY_ID,
-    AWS_SECRET_ACCESS_KEY,
     BUCKET_SECRETS,
     client_config,
 )
@@ -205,17 +203,24 @@ async def apply_slices_to_model(
             participant_hotkey = match.group(1)
 
             slice_i = await get_slices(file_i, model.device)
-            slice_global_step = slice_i.get("global_step")
 
-            if slice_global_step is None:
-                logger.warning(
-                    f"Skipping slice {file_i} because it has no global_step."
-                )
-                continue
+            # Handle both dictionary and tensor returns
+            if isinstance(slice_i, dict):
+                slice_global_step = slice_i.get("global_step")
+                slice_metric = slice_i.get("slice_metric")
+                # Remove non-tensor items from the dictionary
+                tensor_items = {
+                    k: v for k, v in slice_i.items() if isinstance(v, torch.Tensor)
+                }
+            else:
+                # If it's not a dict, assume it's a tensor or tensor-like object
+                slice_global_step = None
+                slice_metric = None
+                tensor_items = slice_i
 
-            max_global_step = max(max_global_step, slice_global_step)
+            if slice_global_step is not None:
+                max_global_step = max(max_global_step, slice_global_step)
 
-            slice_metric = slice_i.get("slice_metric")
             if slice_metric is not None:
                 window_metric[participant_hotkey] = slice_metric
 
@@ -223,48 +228,53 @@ async def apply_slices_to_model(
             slice_norm = 0.0
             slice_values = {}
 
-            for name, param in model.named_parameters():
-                if name not in indices_dict or name not in slice_i:
-                    continue
-                values = slice_i[name].to(model.device)
-                slice_norm += torch.norm(values, p=2).item() ** 2  # Square of L2 norm
-                slice_values[name] = values
+            try:
+                for name, param in model.named_parameters():
+                    # Check if name exists in both dictionaries using dict methods
+                    if (
+                        not isinstance(tensor_items, dict)
+                        or name not in indices_dict.keys()
+                        or name not in tensor_items.keys()
+                    ):
+                        continue
+                    values = tensor_items[name].to(model.device)
+                    slice_norm += torch.norm(values, p=2).item() ** 2
+                    slice_values[name] = values
 
-            slice_norm = (
-                np.sqrt(slice_norm) + 1e-8
-            )  # Add epsilon to avoid division by zero
-            slice_norms.append(slice_norm)  # Collect norm for computing median
-            num_files += 1  # Increment valid file count
+                slice_norm = np.sqrt(slice_norm) + 1e-8
+                slice_norms.append(slice_norm)
+                num_files += 1
 
-            # Normalize and accumulate
-            for name, values in slice_values.items():
-                normalized_values = values / slice_norm
-                param_sums[name] += normalized_values
+                # Normalize and accumulate
+                for name, values in slice_values.items():
+                    normalized_values = values / slice_norm
+                    param_sums[name] += normalized_values
 
-            del slice_i, slice_values
+            except RuntimeError as e:
+                logger.warning(f"Skipping problematic slice {filename}: {str(e)}")
+                continue
 
-        except Timeout:
-            logger.error(f"Timeout occurred while trying to acquire lock on {file_i}")
-            continue
         except Exception as e:
-            logger.exception(f"Error applying slice from {file_i}: {e}")
+            logger.error(f"Error applying slice from {file_i}: {str(e)}")
             continue
 
     if not num_files or not slice_norms:
         logger.warning(f"No valid slices found for window {window}")
         return max_global_step, window_metric
 
-    # Compute median norm
+    # Apply the average of normalized slices
     median_norm = torch.median(torch.tensor(slice_norms))
-
-    # Apply the average of normalized slices to the parameters and scale by median_norm
     for name, param in model.named_parameters():
         if name not in indices_dict:
             continue
         param_indices = indices_dict[name].to(model.device)
-        avg_param = param_sums[name] / num_files  # Average normalized slices
-        avg_param = avg_param * median_norm  # Scale by median norm
+        avg_param = param_sums[name] / num_files
+
+        avg_param = avg_param * median_norm
+        # Convert to the appropriate data type
         avg_param = avg_param.to(param.data.dtype)
+
+        # Apply the averaged and scaled parameter to the model
         param.data.view(-1)[param_indices] = avg_param.clone()
 
     return max_global_step, window_metric
@@ -505,6 +515,46 @@ async def handle_file(
     return None
 
 
+async def validate_slice_data(slice_file: str, save_location: str) -> bool:
+    """
+    Validates a slice file and moves it to appropriate directory based on validity.
+
+    Args:
+        slice_file (str): Path to the slice file
+        save_location (str): Base directory for organizing slices
+
+    Returns:
+        bool: True if slice is valid, False otherwise
+    """
+    try:
+        # Load the slice data
+        slice_data = torch.load(slice_file, weights_only=True)
+
+        # Basic validation checks
+        if not isinstance(slice_data, dict):
+            raise ValueError("Slice data is not a dictionary")
+
+        # Check for required tensor data
+        has_tensors = False
+        for key, value in slice_data.items():
+            if isinstance(value, torch.Tensor):
+                has_tensors = True
+                break
+
+        if not has_tensors:
+            raise ValueError("No tensor data found in slice")
+
+        return True
+
+    except Exception as e:
+        # Handle invalid slice
+
+        filename = os.path.basename(slice_file)
+        logger.warning(f"Invalid slice {filename}: {str(e)}")
+
+        return False
+
+
 async def process_bucket(
     s3_client, bucket: str, windows: List[int], key: str, save_location: str
 ):
@@ -515,25 +565,11 @@ async def process_bucket(
         s3_client: The S3 client to use for operations.
         bucket (str): Name of the S3 bucket to process.
         windows (List[int]): List of window IDs to download files for.
-        key (str, optional): Prefix to filter files by. Defaults to 'slice'.
+        key (str): Prefix to filter files by.
+        save_location (str): Base directory for saving and organizing slices.
 
     Returns:
-        List[SimpleNamespace]: List of downloaded file metadata objects containing:
-            - bucket: The S3 bucket name.
-            - hotkey: The hotkey identifier.
-            - filename: The original S3 object key.
-            - window: The window ID.
-            - temp_file: Path to the downloaded file.
-            - version: Extracted version from the filename.
-
-    The function:
-    1. Validates the bucket name.
-    2. For each window:
-        - Lists objects with matching prefix.
-        - Parses filenames to extract metadata.
-        - Downloads matching files concurrently.
-        - Handles version checking and error cases.
-    3. Returns list of successfully downloaded files.
+        List[SimpleNamespace]: List of downloaded file metadata objects for valid slices.
     """
     # Import the required modules
     import re
@@ -556,6 +592,7 @@ async def process_bucket(
                         f"No contents found for prefix '{prefix}' in bucket '{bucket}'"
                     )
                     continue
+
                 download_tasks = []
                 for obj in page.get("Contents", []):
                     filename = obj["Key"]
@@ -580,11 +617,13 @@ async def process_bucket(
                                 f"(expected {__version__}, got {slice_version})."
                             )
                             continue
+
                         logger.trace(
                             f"Parsed filename '{filename}' into window '{window}', "
                             f"hotkey '{slice_hotkey}', and version '{slice_version}'"
                         )
-                        # Add the download task, passing the version
+
+                        # Add the download task
                         download_tasks.append(
                             handle_file(
                                 s3_client,
@@ -604,7 +643,8 @@ async def process_bucket(
                             f"Unexpected error processing filename '{filename}': {e}"
                         )
                         continue
-                # Download the files concurrently
+
+                # Download and validate files concurrently
                 try:
                     results = await asyncio.gather(
                         *download_tasks, return_exceptions=True
@@ -612,8 +652,18 @@ async def process_bucket(
                     for res in results:
                         if isinstance(res, Exception):
                             logger.error(f"Download task failed: {res}")
-                        elif res:
+                            continue
+
+                        if not res:
+                            continue
+
+                        # Validate the downloaded slice
+                        is_valid = await validate_slice_data(
+                            res.temp_file, save_location
+                        )
+                        if is_valid:
                             files.append(res)
+
                     logger.trace(
                         f"Completed processing page for prefix '{prefix}' in bucket '{bucket}'"
                     )
@@ -621,10 +671,12 @@ async def process_bucket(
                     logger.exception(
                         f"Error during asyncio.gather for prefix '{prefix}': {e}"
                     )
+
         except Exception as e:
             logger.error(
                 f"Error listing objects in bucket '{bucket}' with prefix '{prefix}': {e}"
             )
+
     logger.trace(f"Completed processing bucket '{bucket}' for windows {windows}")
     return files
 
@@ -661,6 +713,7 @@ async def download_slices_for_buckets_and_windows(
         - Handles S3 authentication using bucket credentials
         - Returns empty dict if no valid buckets provided
     """
+    # Filter out None buckets
     # Filter out None buckets
     valid_buckets = []
     for b in buckets:
@@ -866,10 +919,11 @@ async def delete_old_version_files(bucket_name: str, current_version: str):
     session = get_session()
     async with session.create_client(
         "s3",
-        region_name="us-east-1",
+        endpoint_url=get_base_url(BUCKET_SECRETS["account_id"]),
+        region_name=CF_REGION_NAME,
         config=client_config,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        aws_access_key_id=BUCKET_SECRETS["write"]["access_key_id"],
+        aws_secret_access_key=BUCKET_SECRETS["write"]["secret_access_key"],
     ) as s3_client:
         paginator = s3_client.get_paginator("list_objects_v2")
         async for page in paginator.paginate(Bucket=bucket_name):
@@ -1008,7 +1062,7 @@ async def load_checkpoint(
         additional_state (dict): Dictionary of additional state variables.
     """
     try:
-        checkpoint = torch.load(filename, map_location=device)
+        checkpoint = torch.load(filename, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
         if optimizer and "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

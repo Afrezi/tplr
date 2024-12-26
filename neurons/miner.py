@@ -61,7 +61,6 @@ class Miner:
         parser.add_argument('--test', action='store_true', help='Run on test network')
         parser.add_argument('--local', action='store_true', help='Run on local network')
         parser.add_argument('--no_autoupdate', action='store_true', help='Disable automatic updates')
-        parser.add_argument("--process_name", type=str, help="The name of the PM2 process")
         parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to save/load the checkpoint. If None, the path is set to checkpoint-M<UID>.pth.')
         parser.add_argument('--save-location', type=str, default=None, help='Directory to save/load slice files')
         bt.wallet.add_args(parser)
@@ -78,7 +77,7 @@ class Miner:
         if config.trace:
             tplr.trace()
         if not config.no_autoupdate:
-            autoupdater = tplr.AutoUpdate(process_name=config.process_name, bucket_name=config.bucket)
+            autoupdater = tplr.AutoUpdate()
             autoupdater.daemon = True  # Ensure thread exits when main program exits
             autoupdater.start()
         return config
@@ -530,21 +529,21 @@ class Miner:
                         await tplr.delete_files_from_bucket_before_window( bucket = tplr.config.BUCKET_SECRETS["bucket_name"], window_max = window - self.hparams.max_history, key = 'delta' )
                         tplr.logger.info(f"{tplr.P(window, tplr.T() - st)}: Cleaned file history.")
 
-                        # Wait until we are on a new window.
-                        end_step = tplr.T()
-                        while self.current_window == window:
-                            await asyncio.sleep(0.1)
-                        window_time_delta = self.window_time - end_step
-                        window_delta_str = f"[red]{window_time_delta:.2f}[/red]" if window_time_delta < 0 else f"[green]+{window_time_delta:.2f}[/green]"
-                        tplr.logger.info(f"{tplr.P(window, end_step - start_step)}[{window_delta_str}]: Finished step.")
-                        wandb.log({
-                            "miner/loss": step_loss,
-                            "miner/tokens_per_step": tokens_per_step,
-                            "miner/tokens_per_second": tokens_per_second,
-                            "miner/sample_rate": self.sample_rate,
-                            "miner/utilization": train_duration / (end_step - start_step),
-                            "miner/learning_rate": self.scheduler.get_last_lr()[0]
-                        }, step=self.global_step)
+                    # Wait until we are on a new window.
+                    end_step = tplr.T()
+                    while self.current_window == window:
+                        await asyncio.sleep(0.1)
+                    window_time_delta = self.window_time - end_step
+                    window_delta_str = f"[red]{window_time_delta:.2f}[/red]" if window_time_delta < 0 else f"[green]+{window_time_delta:.2f}[/green]"
+                    tplr.logger.info(f"{tplr.P(window, end_step - start_step)}[{window_delta_str}]: Finished step.")
+                    wandb.log({
+                        "miner/loss": step_loss,
+                        "miner/tokens_per_step": tokens_per_step,
+                        "miner/tokens_per_second": tokens_per_second,
+                        "miner/sample_rate": self.sample_rate,
+                        "miner/utilization": train_duration / (end_step - start_step),
+                        "miner/learning_rate": self.scheduler.get_last_lr()[0]
+                    }, step=self.global_step)
 
                 # Catch keyboard interrrupt.
                 except KeyboardInterrupt:
